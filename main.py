@@ -33,10 +33,14 @@ app = FastAPI(
 
 # --- CORS 설정 ---
 origins = [
-    "http://localhost:3000",
+    "http://localhost:3000", # Next.js 기본 포트
+    "http://localhost:5173", # Vite 기본 포트
     "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
     "https://clt-chatbot.vercel.app",
-    "http://202.20.84.65:10000"
+    "https://react-flow-three-ecru.vercel.app",
+    "http://202.20.84.65:10000",
+    "http://202.20.84.65:10001"
 ]
 
 app.add_middleware(
