@@ -1,26 +1,42 @@
+import os
 from fastapi import FastAPI, HTTPException, status, Query, Path, Body, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Union
 from uuid import uuid4
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+# 환경 변수 로드
+load_dotenv()
+
+# Supabase 클라이언트 초기화
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("Warning: SUPABASE_URL or SUPABASE_KEY is missing in .env file.")
+
+# Client 생성 (전역)
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    print(f"Failed to initialize Supabase client: {e}")
+    supabase = None
 
 app = FastAPI(
-    title="CLT Chatbot API (Mock)",
-    description="Mock API for CLT Chatbot Frontend Development",
-    version="1.1.0"
+    title="CLT Chatbot API (Supabase Integration)",
+    description="API connected to Supabase for CLT Chatbot",
+    version="1.2.0"
 )
 
-# --- CORS 설정 (프론트엔드 연동을 위해 필수) ---
+# --- CORS 설정 ---
 origins = [
-    "http://localhost:3000", # Next.js 기본 포트
-    "http://localhost:5173", # Vite 기본 포트
+    "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "http://127.0.0.1:5173",
     "https://clt-chatbot.vercel.app",
-    "https://react-flow-three-ecru.vercel.app",
-    "http://202.20.84.65:10000",
-    "http://202.20.84.65:10001"
+    "http://202.20.84.65:10000"
 ]
 
 app.add_middleware(
@@ -32,10 +48,11 @@ app.add_middleware(
 )
 
 # ==========================================
-# [Existing] Chat Client Models & Logic
+# [Models]
 # ==========================================
+# (이전과 동일한 모델 정의)
 
-# 1. Chat 관련 모델
+# 1. Chat Models
 class ChatRequest(BaseModel):
     conversation_id: Optional[str] = Field(None, description="기존 대화 ID")
     content: str = Field(..., description="사용자 메시지")
@@ -48,10 +65,10 @@ class ChatResponse(BaseModel):
     slots: Optional[Dict[str, Any]] = None
     next_node: Optional[Dict[str, Any]] = None
 
-# 2. Conversation 관련 모델
+# 2. Conversation Models
 class ConversationSummary(BaseModel):
     id: str
-    title: str
+    title: Optional[str] = None
     is_pinned: bool
     created_at: datetime
     updated_at: datetime
@@ -65,7 +82,7 @@ class UpdateConversationRequest(BaseModel):
 
 class Message(BaseModel):
     id: str
-    role: str = Field(..., pattern="^(user|assistant)$")
+    role: str
     content: str
     created_at: datetime
 
@@ -73,7 +90,7 @@ class ConversationDetail(BaseModel):
     id: str
     messages: List[Message]
 
-# 3. Client Side Scenario Models (기존)
+# 3. Client Scenarios (이 부분은 정적 데이터로 유지하거나 별도 테이블로 뺄 수 있음)
 class ScenarioItem(BaseModel):
     id: str
     title: str
@@ -83,19 +100,14 @@ class ScenarioCategory(BaseModel):
     category: str
     items: List[ScenarioItem]
 
-
-# ==========================================
-# [New] Admin / Management API Models
-# ==========================================
-
-# --- Common Structures ---
+# 4. Admin Models
 class NodePosition(BaseModel):
     x: float
     y: float
 
 class Node(BaseModel):
     id: str
-    type: str  # e.g., "message", "form", "api"
+    type: str
     position: NodePosition
     data: Dict[str, Any] = {}
     width: Optional[float] = None
@@ -107,7 +119,6 @@ class Edge(BaseModel):
     target: str
     sourceHandle: Optional[str] = None
 
-# --- Scenario Management Models ---
 class ScenarioListItem(BaseModel):
     id: str
     name: str
@@ -121,8 +132,8 @@ class ScenarioDetail(BaseModel):
     name: str
     job: Optional[str] = None
     description: Optional[str] = None
-    nodes: List[Node] = []
-    edges: List[Edge] = []
+    nodes: List[Dict[str, Any]] = [] # JSONB 호환
+    edges: List[Dict[str, Any]] = []
     start_node_id: Optional[str] = None
     created_at: datetime
     updated_at: datetime
@@ -133,21 +144,17 @@ class CreateScenarioRequest(BaseModel):
     job: Optional[str] = "Process"
     description: Optional[str] = ""
     category_id: Optional[str] = None
-    nodes: List[Node] = []
-    edges: List[Edge] = []
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
     start_node_id: Optional[str] = None
-    clone_from_id: Optional[str] = None # 복제 시 사용
+    clone_from_id: Optional[str] = None
 
 class UpdateScenarioRequest(BaseModel):
-    # API 명세에 있는 ten_id, stg_id 등은 Path 파라미터로 받지만 Body에도 포함될 수 있음
-    ten_id: Optional[str] = None
-    stg_id: Optional[str] = None
-    category_id: Optional[str] = None
     name: str
     job: str
     description: Optional[str] = None
-    nodes: List[Node]
-    edges: List[Edge]
+    nodes: List[Dict[str, Any]]
+    edges: List[Dict[str, Any]]
     start_node_id: Optional[str] = None
 
 class PatchScenarioRequest(BaseModel):
@@ -159,7 +166,6 @@ class PatchScenarioRequest(BaseModel):
 class ScenarioListResponse(BaseModel):
     scenarios: List[ScenarioListItem]
 
-# --- Template Models ---
 class ApiTemplateCreate(BaseModel):
     name: str
     method: str = "GET"
@@ -168,321 +174,300 @@ class ApiTemplateCreate(BaseModel):
     body: Optional[Union[str, Dict]] = "{}"
     responseMapping: List[Any] = []
 
-class ApiTemplate(ApiTemplateCreate):
-    id: str
-
 class FormTemplateCreate(BaseModel):
     name: str
     title: str
     elements: List[Any] = []
 
-class FormTemplate(FormTemplateCreate):
-    id: str
-
-# --- Settings Models ---
 class NodeVisibilitySettings(BaseModel):
     visibleNodeTypes: List[str]
 
 
 # ==========================================
-# [In-Memory Mock Data Store]
+# [Helpers]
 # ==========================================
-
-# 1. Existing Client Chat Data
-MOCK_CONVERSATIONS: List[Dict] = [
-    {
-        "id": "uuid-1",
-        "title": "기본 인사 테스트",
-        "is_pinned": True,
-        "created_at": datetime.now(timezone.utc),
-        "updated_at": datetime.now(timezone.utc)
-    },
-    {
-        "id": "uuid-2",
-        "title": "비자 신청 문의",
-        "is_pinned": False,
-        "created_at": datetime.now(timezone.utc),
-        "updated_at": datetime.now(timezone.utc)
-    }
-]
-
-MOCK_MESSAGES: Dict[str, List[Dict]] = {
-    "uuid-1": [
-        {"id": "msg-1", "role": "user", "content": "안녕?", "created_at": datetime.now(timezone.utc)},
-        {"id": "msg-2", "role": "assistant", "content": "안녕하세요! 무엇을 도와드릴까요?", "created_at": datetime.now(timezone.utc)}
-    ],
-    "uuid-2": []
-}
-
-MOCK_SCENARIOS_CLIENT = [
-    {
-        "category": "인사",
-        "items": [
-            {"id": "greeting", "title": "기본 인사", "description": "봇과 가볍게 인사를 나눕니다."},
-            {"id": "intro", "title": "봇 소개", "description": "이 봇의 기능을 설명합니다."}
-        ]
-    },
-    {
-        "category": "민원",
-        "items": [
-            {"id": "visa", "title": "비자 문의", "description": "비자 발급 절차를 안내합니다."},
-            {"id": "tax", "title": "세금 납부", "description": "지방세 납부 방법을 안내합니다."}
-        ]
-    }
-]
-
-# 2. New Admin/Management Data
-# 관리자용 시나리오 DB
-MOCK_ADMIN_SCENARIOS: List[Dict] = [
-    {
-        "id": "scen-1",
-        "name": "예약 시나리오",
-        "job": "Process",
-        "description": "사용자 예약을 처리하는 메인 흐름",
-        "nodes": [
-            {
-                "id": "node-1", "type": "message", 
-                "position": {"x": 100, "y": 100}, 
-                "data": {"content": "안녕하세요, 예약을 도와드릴까요?"},
-                "width": 200, "height": 100
-            },
-            {
-                "id": "node-2", "type": "form",
-                "position": {"x": 400, "y": 100},
-                "data": {"schema": {}},
-                "width": 300, "height": 200
-            }
-        ],
-        "edges": [
-            {"id": "edge-1", "source": "node-1", "target": "node-2"}
-        ],
-        "start_node_id": "node-1",
-        "created_at": datetime.now(timezone.utc),
-        "updated_at": datetime.now(timezone.utc),
-        "last_used_at": datetime.now(timezone.utc)
-    }
-]
-
-# 템플릿 DB
-MOCK_API_TEMPLATES: List[Dict] = []
-MOCK_FORM_TEMPLATES: List[Dict] = []
-
-# 설정 DB (Tenant ID를 키로 사용)
-MOCK_SETTINGS: Dict[str, Dict] = {
-    "default": {
-        "visibleNodeTypes": ["message", "form", "api", "branch", "condition"]
-    }
-}
-
+def get_utc_now():
+    return datetime.now(timezone.utc).isoformat()
 
 # ==========================================
 # [API Endpoints]
 # ==========================================
 
-# 1. Existing Chat Endpoints
+# 1. Existing Chat Endpoints (Supabase Integrated)
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    response_msg = f"Echo: {request.content} (Mock Response)"
-    if request.conversation_id and request.conversation_id in MOCK_MESSAGES:
-        MOCK_MESSAGES[request.conversation_id].append({
-            "id": str(uuid4()), "role": "user", "content": request.content, "created_at": datetime.now(timezone.utc)
-        })
-        MOCK_MESSAGES[request.conversation_id].append({
-            "id": str(uuid4()), "role": "assistant", "content": response_msg, "created_at": datetime.now(timezone.utc)
-        })
+    """
+    사용자 메시지를 저장하고 에코 응답을 생성하여 저장합니다.
+    """
+    response_msg = f"Echo: {request.content} (Supabase)"
     
-    return {"type": "text", "message": response_msg, "slots": request.slots or {}, "next_node": None}
+    if request.conversation_id:
+        # 1. 사용자 메시지 DB 저장
+        try:
+            supabase.table("messages").insert({
+                "conversation_id": request.conversation_id,
+                "role": "user",
+                "content": request.content,
+                "created_at": get_utc_now()
+            }).execute()
+
+            # 2. 봇 메시지 DB 저장
+            supabase.table("messages").insert({
+                "conversation_id": request.conversation_id,
+                "role": "assistant",
+                "content": response_msg,
+                "created_at": get_utc_now()
+            }).execute()
+            
+            # 3. 대화방 updated_at 갱신
+            supabase.table("conversations").update({
+                "updated_at": get_utc_now()
+            }).eq("id", request.conversation_id).execute()
+            
+        except Exception as e:
+            print(f"Error saving chat: {e}")
+            # 실제 운영시엔 에러 처리 필요, 여기선 진행
+
+    return {
+        "type": "text",
+        "message": response_msg,
+        "slots": request.slots or {},
+        "next_node": None
+    }
 
 @app.get("/conversations", response_model=List[ConversationSummary])
 async def get_conversations():
-    return MOCK_CONVERSATIONS
+    """모든 대화방 목록 조회 (최신순)"""
+    res = supabase.table("conversations").select("*").order("updated_at", desc=True).execute()
+    return res.data
 
 @app.post("/conversations", status_code=status.HTTP_201_CREATED, response_model=ConversationSummary)
 async def create_conversation(request: CreateConversationRequest):
-    new_id = str(uuid4())
+    """새 대화방 생성"""
     new_title = request.title if request.title else "New Chat"
-    now = datetime.now(timezone.utc)
-    new_conv = {"id": new_id, "title": new_title, "is_pinned": False, "created_at": now, "updated_at": now}
-    MOCK_CONVERSATIONS.insert(0, new_conv)
-    MOCK_MESSAGES[new_id] = []
-    return new_conv
+    
+    data = {
+        "title": new_title,
+        "is_pinned": False,
+        "created_at": get_utc_now(),
+        "updated_at": get_utc_now()
+    }
+    
+    res = supabase.table("conversations").insert(data).execute()
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Failed to create conversation")
+    
+    return res.data[0]
 
 @app.get("/conversations/{conversation_id}", response_model=ConversationDetail)
-async def get_conversation_detail(conversation_id: str = Path(...), limit: int = Query(50), offset: int = Query(0)):
-    if conversation_id not in MOCK_MESSAGES:
+async def get_conversation_detail(
+    conversation_id: str = Path(...),
+    limit: int = Query(50),
+    offset: int = Query(0)
+):
+    """대화방 상세 및 메시지 페이징"""
+    # 대화방 존재 확인
+    conv_res = supabase.table("conversations").select("id").eq("id", conversation_id).execute()
+    if not conv_res.data:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    sliced = MOCK_MESSAGES[conversation_id][offset:offset+limit]
-    return {"id": conversation_id, "messages": sliced}
+    
+    # 메시지 조회 (Paging)
+    # Supabase range is 0-indexed inclusive
+    msg_res = supabase.table("messages")\
+        .select("*")\
+        .eq("conversation_id", conversation_id)\
+        .order("created_at", desc=False)\
+        .range(offset, offset + limit - 1)\
+        .execute()
+        
+    return {
+        "id": conversation_id,
+        "messages": msg_res.data
+    }
 
 @app.patch("/conversations/{conversation_id}", response_model=ConversationSummary)
 async def update_conversation(conversation_id: str, request: UpdateConversationRequest):
-    target_conv = next((c for c in MOCK_CONVERSATIONS if c["id"] == conversation_id), None)
-    if not target_conv:
+    update_data = {"updated_at": get_utc_now()}
+    if request.title is not None:
+        update_data["title"] = request.title
+    if request.is_pinned is not None:
+        update_data["is_pinned"] = request.is_pinned
+        
+    res = supabase.table("conversations").update(update_data).eq("id", conversation_id).execute()
+    
+    if not res.data:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    if request.title is not None: target_conv["title"] = request.title
-    if request.is_pinned is not None: target_conv["is_pinned"] = request.is_pinned
-    target_conv["updated_at"] = datetime.now(timezone.utc)
-    return target_conv
+    
+    return res.data[0]
 
 @app.delete("/conversations/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_conversation(conversation_id: str):
-    global MOCK_CONVERSATIONS
-    initial_len = len(MOCK_CONVERSATIONS)
-    MOCK_CONVERSATIONS = [c for c in MOCK_CONVERSATIONS if c["id"] != conversation_id]
-    if len(MOCK_CONVERSATIONS) == initial_len:
+    # Cascade delete가 설정되어 있다면 메시지도 자동 삭제됨
+    res = supabase.table("conversations").delete().eq("id", conversation_id).execute()
+    if not res.data:
          raise HTTPException(status_code=404, detail="Conversation not found")
-    if conversation_id in MOCK_MESSAGES: del MOCK_MESSAGES[conversation_id]
     return None
 
+# Client Side Static Data (이 부분은 보통 하드코딩 유지하거나 별도 테이블 생성)
 @app.get("/scenarios", response_model=List[ScenarioCategory])
 async def get_client_scenarios():
-    return MOCK_SCENARIOS_CLIENT
+    # 간단한 예시로 하드코딩 유지. 필요시 'scenario_categories' 테이블 연동
+    return [
+        {
+            "category": "인사",
+            "items": [
+                {"id": "greeting", "title": "기본 인사", "description": "봇과 가볍게 인사를 나눕니다."},
+                {"id": "intro", "title": "봇 소개", "description": "이 봇의 기능을 설명합니다."}
+            ]
+        },
+        {
+            "category": "민원",
+            "items": [
+                {"id": "visa", "title": "비자 문의", "description": "비자 발급 절차를 안내합니다."},
+                {"id": "tax", "title": "세금 납부", "description": "지방세 납부 방법을 안내합니다."}
+            ]
+        }
+    ]
 
 
-# 2. NEW Admin/Management Endpoints
-# 문서의 Base URL: /api/v1/chat
+# 2. Admin/Management Endpoints (Supabase Integrated)
 admin_router = APIRouter(prefix="/api/v1/chat")
 
-# --- Scenarios ---
 @admin_router.get("/scenarios/{tenant_id}/{stage_id}", response_model=ScenarioListResponse)
 async def list_admin_scenarios(tenant_id: str, stage_id: str):
-    """전체 시나리오 목록 조회"""
-    # Mock: tenant_id, stage_id 구분 없이 모든 Mock 데이터 반환
-    return {"scenarios": MOCK_ADMIN_SCENARIOS}
+    res = supabase.table("admin_scenarios")\
+        .select("id, name, job, description, updated_at, last_used_at")\
+        .eq("tenant_id", tenant_id)\
+        .eq("stage_id", stage_id)\
+        .order("updated_at", desc=True)\
+        .execute()
+    return {"scenarios": res.data}
 
 @admin_router.get("/scenarios/{tenant_id}/{stage_id}/{scenario_id}", response_model=ScenarioDetail)
 async def get_admin_scenario_detail(tenant_id: str, stage_id: str, scenario_id: str):
-    """특정 시나리오 상세 조회"""
-    scenario = next((s for s in MOCK_ADMIN_SCENARIOS if s["id"] == scenario_id), None)
-    if not scenario:
+    res = supabase.table("admin_scenarios").select("*").eq("id", scenario_id).execute()
+    if not res.data:
         raise HTTPException(status_code=404, detail="Scenario not found")
-    return scenario
+    return res.data[0]
 
 @admin_router.post("/scenarios/{tenant_id}/{stage_id}", status_code=status.HTTP_201_CREATED, response_model=ScenarioDetail)
 async def create_admin_scenario(tenant_id: str, stage_id: str, request: CreateScenarioRequest):
-    """시나리오 생성 및 복제"""
-    new_id = str(uuid4())
-    now = datetime.now(timezone.utc)
-    
-    new_scenario = {
-        "id": new_id,
+    new_data = {
+        "tenant_id": tenant_id,
+        "stage_id": stage_id,
         "name": request.name,
         "job": request.job,
         "description": request.description,
-        "nodes": [],
-        "edges": [],
-        "start_node_id": None,
-        "created_at": now,
-        "updated_at": now,
-        "last_used_at": now
+        "nodes": request.nodes,
+        "edges": request.edges,
+        "start_node_id": request.start_node_id,
+        "category_id": request.category_id,
+        "created_at": get_utc_now(),
+        "updated_at": get_utc_now(),
+        "last_used_at": get_utc_now()
     }
     
     # 복제 로직
     if request.clone_from_id:
-        original = next((s for s in MOCK_ADMIN_SCENARIOS if s["id"] == request.clone_from_id), None)
-        if original:
-            new_scenario["nodes"] = original["nodes"]
-            new_scenario["edges"] = original["edges"]
-            new_scenario["start_node_id"] = original["start_node_id"]
-    else:
-        new_scenario["nodes"] = request.nodes
-        new_scenario["edges"] = request.edges
-        new_scenario["start_node_id"] = request.start_node_id
-        
-    MOCK_ADMIN_SCENARIOS.append(new_scenario)
-    return new_scenario
+        original = supabase.table("admin_scenarios").select("*").eq("id", request.clone_from_id).execute()
+        if original.data:
+            org = original.data[0]
+            new_data["nodes"] = org["nodes"]
+            new_data["edges"] = org["edges"]
+            new_data["start_node_id"] = org["start_node_id"]
+    
+    res = supabase.table("admin_scenarios").insert(new_data).execute()
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Failed to create scenario")
+    return res.data[0]
 
 @admin_router.put("/scenarios/{tenant_id}/{stage_id}/{scenario_id}", response_model=ScenarioDetail)
 async def update_admin_scenario(tenant_id: str, stage_id: str, scenario_id: str, request: UpdateScenarioRequest):
-    """시나리오 전체 수정 (저장)"""
-    scenario = next((s for s in MOCK_ADMIN_SCENARIOS if s["id"] == scenario_id), None)
-    if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
-    
-    scenario.update({
+    update_data = {
         "name": request.name,
         "job": request.job,
         "description": request.description,
-        "nodes": [n.model_dump() for n in request.nodes],
-        "edges": [e.model_dump() for e in request.edges],
+        "nodes": request.nodes,
+        "edges": request.edges,
         "start_node_id": request.start_node_id,
-        "updated_at": datetime.now(timezone.utc)
-    })
-    return scenario
+        "updated_at": get_utc_now()
+    }
+    
+    res = supabase.table("admin_scenarios").update(update_data).eq("id", scenario_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    return res.data[0]
 
 @admin_router.patch("/scenarios/{tenant_id}/{stage_id}/{scenario_id}", response_model=ScenarioListItem)
 async def patch_admin_scenario(tenant_id: str, stage_id: str, scenario_id: str, request: PatchScenarioRequest):
-    """시나리오 부분 수정 (이름/설명 또는 최근 사용시간)"""
-    scenario = next((s for s in MOCK_ADMIN_SCENARIOS if s["id"] == scenario_id), None)
-    if not scenario:
-        raise HTTPException(status_code=404, detail="Scenario not found")
-        
-    if request.name is not None: scenario["name"] = request.name
-    if request.job is not None: scenario["job"] = request.job
-    if request.description is not None: scenario["description"] = request.description
-    if request.last_used_at is not None: scenario["last_used_at"] = request.last_used_at
+    update_data = {"updated_at": get_utc_now()}
+    if request.name is not None: update_data["name"] = request.name
+    if request.job is not None: update_data["job"] = request.job
+    if request.description is not None: update_data["description"] = request.description
+    if request.last_used_at is not None: update_data["last_used_at"] = request.last_used_at
     
-    scenario["updated_at"] = datetime.now(timezone.utc)
-    return scenario
+    res = supabase.table("admin_scenarios").update(update_data).eq("id", scenario_id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Scenario not found")
+    return res.data[0]
 
 @admin_router.delete("/scenarios/{tenant_id}/{stage_id}/{scenario_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_admin_scenario(tenant_id: str, stage_id: str, scenario_id: str):
-    """시나리오 삭제"""
-    global MOCK_ADMIN_SCENARIOS
-    initial_len = len(MOCK_ADMIN_SCENARIOS)
-    MOCK_ADMIN_SCENARIOS = [s for s in MOCK_ADMIN_SCENARIOS if s["id"] != scenario_id]
-    if len(MOCK_ADMIN_SCENARIOS) == initial_len:
+    res = supabase.table("admin_scenarios").delete().eq("id", scenario_id).execute()
+    if not res.data:
         raise HTTPException(status_code=404, detail="Scenario not found")
     return None
 
-# --- Templates (API) ---
-@admin_router.get("/templates/api/{tenant_id}", response_model=List[ApiTemplate])
+# --- Templates ---
+@admin_router.get("/templates/api/{tenant_id}", response_model=List[Dict])
 async def list_api_templates(tenant_id: str):
-    return MOCK_API_TEMPLATES
+    res = supabase.table("api_templates").select("*").eq("tenant_id", tenant_id).execute()
+    return res.data
 
-@admin_router.post("/templates/api/{tenant_id}", status_code=status.HTTP_201_CREATED, response_model=ApiTemplate)
+@admin_router.post("/templates/api/{tenant_id}", status_code=status.HTTP_201_CREATED)
 async def create_api_template(tenant_id: str, request: ApiTemplateCreate):
-    new_tmpl = request.model_dump()
-    new_tmpl["id"] = str(uuid4())
-    MOCK_API_TEMPLATES.append(new_tmpl)
-    return new_tmpl
+    data = request.model_dump()
+    data["tenant_id"] = tenant_id
+    res = supabase.table("api_templates").insert(data).execute()
+    return res.data[0]
 
 @admin_router.delete("/templates/api/{tenant_id}/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_api_template(tenant_id: str, template_id: str):
-    global MOCK_API_TEMPLATES
-    MOCK_API_TEMPLATES = [t for t in MOCK_API_TEMPLATES if t["id"] != template_id]
+    supabase.table("api_templates").delete().eq("id", template_id).execute()
     return None
 
-# --- Templates (Form) ---
-@admin_router.get("/templates/form/{tenant_id}", response_model=List[FormTemplate])
+@admin_router.get("/templates/form/{tenant_id}", response_model=List[Dict])
 async def list_form_templates(tenant_id: str):
-    return MOCK_FORM_TEMPLATES
+    res = supabase.table("form_templates").select("*").eq("tenant_id", tenant_id).execute()
+    return res.data
 
-@admin_router.post("/templates/form/{tenant_id}", status_code=status.HTTP_201_CREATED, response_model=FormTemplate)
+@admin_router.post("/templates/form/{tenant_id}", status_code=status.HTTP_201_CREATED)
 async def create_form_template(tenant_id: str, request: FormTemplateCreate):
-    new_tmpl = request.model_dump()
-    new_tmpl["id"] = str(uuid4())
-    MOCK_FORM_TEMPLATES.append(new_tmpl)
-    return new_tmpl
+    data = request.model_dump()
+    data["tenant_id"] = tenant_id
+    res = supabase.table("form_templates").insert(data).execute()
+    return res.data[0]
 
 @admin_router.delete("/templates/form/{tenant_id}/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_form_template(tenant_id: str, template_id: str):
-    global MOCK_FORM_TEMPLATES
-    MOCK_FORM_TEMPLATES = [t for t in MOCK_FORM_TEMPLATES if t["id"] != template_id]
+    supabase.table("form_templates").delete().eq("id", template_id).execute()
     return None
 
 # --- Settings ---
 @admin_router.get("/settings/{tenant_id}/node_visibility", response_model=NodeVisibilitySettings)
 async def get_node_visibility(tenant_id: str):
-    # Tenant별 설정이 없으면 default 반환
-    return MOCK_SETTINGS.get(tenant_id, MOCK_SETTINGS["default"])
+    res = supabase.table("settings").select("node_visibility").eq("tenant_id", tenant_id).execute()
+    if res.data:
+        return res.data[0]["node_visibility"]
+    return {"visibleNodeTypes": ["message", "form", "api", "branch", "condition"]} # Default
 
 @admin_router.put("/settings/{tenant_id}/node_visibility", response_model=NodeVisibilitySettings)
 async def update_node_visibility(tenant_id: str, settings: NodeVisibilitySettings):
-    MOCK_SETTINGS[tenant_id] = settings.model_dump()
-    return MOCK_SETTINGS[tenant_id]
+    data = {"tenant_id": tenant_id, "node_visibility": settings.model_dump()}
+    # Upsert (Insert or Update)
+    res = supabase.table("settings").upsert(data).execute()
+    return res.data[0]["node_visibility"]
 
-# 라우터 등록
 app.include_router(admin_router)
 
 if __name__ == "__main__":
