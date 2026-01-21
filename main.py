@@ -1,5 +1,7 @@
+import asyncio
 import os
-from fastapi import FastAPI, HTTPException, status, Query, Path, Body, APIRouter
+import json  # JSON 변환을 위해 추가
+from fastapi import FastAPI, BackgroundTasks, HTTPException, status, Query, Path, Body, APIRouter, Request # Request 추가
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Union
@@ -7,6 +9,7 @@ from uuid import uuid4
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from sse_starlette.sse import EventSourceResponse # [설치 필요] pip install sse-starlette
 
 # 환경 변수 로드
 load_dotenv()
@@ -60,6 +63,14 @@ app.add_middleware(
 )
 
 # ==========================================
+# [전역 변수: 이벤트 큐]
+# ==========================================
+# 백그라운드 태스크와 SSE 엔드포인트 간의 통신을 위한 메모리 큐입니다.
+# 실제 상용 서비스(다중 서버)에서는 Redis Pub/Sub 등을 사용하는 것이 좋습니다.
+event_queue = asyncio.Queue()
+
+
+# ==========================================
 # [Models]
 # ==========================================
 # (이전과 동일한 모델 정의)
@@ -102,7 +113,7 @@ class ConversationDetail(BaseModel):
     id: str
     messages: List[Message]
 
-# 3. Client Scenarios (이 부분은 정적 데이터로 유지하거나 별도 테이블로 뺄 수 있음)
+# 3. Client Scenarios
 class ScenarioItem(BaseModel):
     id: str
     title: str
@@ -144,7 +155,7 @@ class ScenarioDetail(BaseModel):
     name: str
     job: Optional[str] = None
     description: Optional[str] = None
-    nodes: List[Dict[str, Any]] = [] # JSONB 호환
+    nodes: List[Dict[str, Any]] = [] 
     edges: List[Dict[str, Any]] = []
     start_node_id: Optional[str] = None
     created_at: datetime
@@ -202,20 +213,105 @@ def get_utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 # ==========================================
+# [Background Tasks]
+# ==========================================
+async def perform_background_task(conversation_id: str):
+    # 1. 무거운 작업을 시뮬레이션 (5초 대기)
+    print(f"⏳ [Task] 비동기 작업 시작 (ID: {conversation_id})")
+    await asyncio.sleep(5) 
+    
+    success_msg = "✅ 처리 완료 (5초 후 생성됨)"
+    
+    # 2. 작업 완료 후 DB에 결과 저장
+    try:
+        supabase.table("messages").insert({
+            "conversation_id": conversation_id,
+            "role": "assistant",
+            "content": success_msg,
+            "created_at": get_utc_now()
+        }).execute()
+        
+        # (선택) 대화방 updated_at 갱신
+        supabase.table("conversations").update({
+            "updated_at": get_utc_now()
+        }).eq("id", conversation_id).execute()
+        
+        print(f"✅ [Task] 비동기 작업 완료 및 DB 저장 (ID: {conversation_id})")
+        
+        # 3. [추가됨] SSE 큐에 완료 이벤트 전송
+        # 프론트엔드가 /events에 연결되어 있다면 이 메시지를 받게 됩니다.
+        await event_queue.put({
+            "conversation_id": conversation_id,
+            "status": "done",
+            "message": success_msg,
+            "timestamp": get_utc_now()
+        })
+        print(f"📡 [Task] SSE 알림 큐 전송 완료")
+        
+    except Exception as e:
+        print(f"❌ [Task] Error in background task: {e}")
+
+# ==========================================
 # [API Endpoints]
 # ==========================================
 
-# 1. Existing Chat Endpoints (Supabase Integrated)
+# 1. SSE Endpoint
+@app.get("/events")
+async def sse_endpoint(request: Request):
+    """
+    Server-Sent Events 엔드포인트
+    클라이언트는 이 주소에 연결하여 백그라운드 작업 완료 알림을 실시간으로 수신합니다.
+    """
+    async def event_generator():
+        while True:
+            # 클라이언트 연결 끊김 확인
+            if await request.is_disconnected():
+                break
+
+            # 큐에서 메시지가 올 때까지 대기 (비동기)
+            try:
+                # 큐에서 데이터를 가져옴
+                data = await event_queue.get()
+                
+                # SSE 포맷으로 데이터 전송
+                # 한글 깨짐 방지를 위해 ensure_ascii=False 사용
+                yield {
+                    "event": "message",
+                    "data": json.dumps(data, ensure_ascii=False)
+                }
+                
+                # 큐 작업 완료 처리
+                event_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"SSE Error: {e}")
+                break
+                
+    return EventSourceResponse(event_generator())
+
+# 2. Existing Chat Endpoints
 @app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
     """
-    사용자 메시지를 저장하고 에코 응답을 생성하여 저장합니다.
+    사용자 메시지를 저장하고 응답을 반환합니다.
+    '딜레이'가 포함되면 즉시 응답 후 백그라운드 작업을 실행합니다.
     """
-    response_msg = f"Echo: {request.content} (Supabase)"
     
+    # 1. 응답 메시지 결정 & 백그라운드 태스크 등록
+    if "딜레이" in request.content:
+        response_msg = "⏳ 처리중입니다... (결과는 잠시 후 도착합니다)"
+        
+        # ✨ [핵심] 응답 리턴 후 실행할 작업을 큐에 등록
+        if request.conversation_id:
+            background_tasks.add_task(perform_background_task, request.conversation_id)
+    else:
+        response_msg = f"Echo: {request.content} (Supabase)"
+
+    # 2. DB 저장 로직 (사용자 메시지 + 1차 응답 메시지)
     if request.conversation_id:
-        # 1. 사용자 메시지 DB 저장
         try:
+            # (1) 사용자 메시지 저장
             supabase.table("messages").insert({
                 "conversation_id": request.conversation_id,
                 "role": "user",
@@ -223,7 +319,7 @@ async def chat(request: ChatRequest):
                 "created_at": get_utc_now()
             }).execute()
 
-            # 2. 봇 메시지 DB 저장
+            # (2) 봇의 1차 응답(Echo 또는 처리중) 저장
             supabase.table("messages").insert({
                 "conversation_id": request.conversation_id,
                 "role": "assistant",
@@ -231,15 +327,15 @@ async def chat(request: ChatRequest):
                 "created_at": get_utc_now()
             }).execute()
             
-            # 3. 대화방 updated_at 갱신
+            # (3) 대화방 갱신
             supabase.table("conversations").update({
                 "updated_at": get_utc_now()
             }).eq("id", request.conversation_id).execute()
             
         except Exception as e:
             print(f"Error saving chat: {e}")
-            # 실제 운영시엔 에러 처리 필요, 여기선 진행
 
+    # 3. 클라이언트에게는 즉시 응답 반환
     return {
         "type": "text",
         "message": response_msg,
@@ -278,13 +374,10 @@ async def get_conversation_detail(
     offset: int = Query(0)
 ):
     """대화방 상세 및 메시지 페이징"""
-    # 대화방 존재 확인
     conv_res = supabase.table("conversations").select("id").eq("id", conversation_id).execute()
     if not conv_res.data:
         raise HTTPException(status_code=404, detail="Conversation not found")
     
-    # 메시지 조회 (Paging)
-    # Supabase range is 0-indexed inclusive
     msg_res = supabase.table("messages")\
         .select("*")\
         .eq("conversation_id", conversation_id)\
@@ -314,16 +407,14 @@ async def update_conversation(conversation_id: str, request: UpdateConversationR
 
 @app.delete("/conversations/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_conversation(conversation_id: str):
-    # Cascade delete가 설정되어 있다면 메시지도 자동 삭제됨
     res = supabase.table("conversations").delete().eq("id", conversation_id).execute()
     if not res.data:
          raise HTTPException(status_code=404, detail="Conversation not found")
     return None
 
-# Client Side Static Data (이 부분은 보통 하드코딩 유지하거나 별도 테이블 생성)
+# Client Side Static Data
 @app.get("/scenarios", response_model=List[ScenarioCategory])
 async def get_client_scenarios():
-    # 간단한 예시로 하드코딩 유지. 필요시 'scenario_categories' 테이블 연동
     return [
         {
             "category": "인사",
@@ -342,7 +433,7 @@ async def get_client_scenarios():
     ]
 
 
-# 2. Admin/Management Endpoints (Supabase Integrated)
+# 2. Admin/Management Endpoints
 admin_router = APIRouter(prefix="/api/v1/chat")
 
 @admin_router.get("/scenarios/{tenant_id}/{stage_id}", response_model=ScenarioListResponse)
@@ -471,12 +562,11 @@ async def get_node_visibility(tenant_id: str):
     res = supabase.table("settings").select("node_visibility").eq("tenant_id", tenant_id).execute()
     if res.data:
         return res.data[0]["node_visibility"]
-    return {"visibleNodeTypes": ["message", "form", "api", "branch", "condition"]} # Default
+    return {"visibleNodeTypes": ["message", "form", "api", "branch", "condition"]}
 
 @admin_router.put("/settings/{tenant_id}/node_visibility", response_model=NodeVisibilitySettings)
 async def update_node_visibility(tenant_id: str, settings: NodeVisibilitySettings):
     data = {"tenant_id": tenant_id, "node_visibility": settings.model_dump()}
-    # Upsert (Insert or Update)
     res = supabase.table("settings").upsert(data).execute()
     return res.data[0]["node_visibility"]
 
