@@ -405,7 +405,8 @@ async def update_conversation(conversation_id: str, request: UpdateConversationR
     
     return res.data[0]
 
-@app.delete("/conversations/{conversation_id}", status_code=status.HTTP_204_NO_CONTENT)
+# [변경됨] DELETE -> POST + URL 뒤에 /delete 추가
+@app.post("/conversations/{conversation_id}/delete", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_conversation(conversation_id: str):
     res = supabase.table("conversations").delete().eq("id", conversation_id).execute()
     if not res.data:
@@ -514,7 +515,8 @@ async def patch_admin_scenario(tenant_id: str, stage_id: str, scenario_id: str, 
         raise HTTPException(status_code=404, detail="Scenario not found")
     return res.data[0]
 
-@admin_router.delete("/scenarios/{tenant_id}/{stage_id}/{scenario_id}", status_code=status.HTTP_204_NO_CONTENT)
+# [변경됨] DELETE -> POST + URL 뒤에 /delete 추가
+@admin_router.post("/scenarios/{tenant_id}/{stage_id}/{scenario_id}/delete", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_admin_scenario(tenant_id: str, stage_id: str, scenario_id: str):
     res = supabase.table("admin_scenarios").delete().eq("id", scenario_id).execute()
     if not res.data:
@@ -534,7 +536,8 @@ async def create_api_template(tenant_id: str, request: ApiTemplateCreate):
     res = supabase.table("api_templates").insert(data).execute()
     return res.data[0]
 
-@admin_router.delete("/templates/api/{tenant_id}/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+# [변경됨] DELETE -> POST + URL 뒤에 /delete 추가
+@admin_router.post("/templates/api/{tenant_id}/{template_id}/delete", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_api_template(tenant_id: str, template_id: str):
     supabase.table("api_templates").delete().eq("id", template_id).execute()
     return None
@@ -551,7 +554,8 @@ async def create_form_template(tenant_id: str, request: FormTemplateCreate):
     res = supabase.table("form_templates").insert(data).execute()
     return res.data[0]
 
-@admin_router.delete("/templates/form/{tenant_id}/{template_id}", status_code=status.HTTP_204_NO_CONTENT)
+# [변경됨] DELETE -> POST + URL 뒤에 /delete 추가
+@admin_router.post("/templates/form/{tenant_id}/{template_id}/delete", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_form_template(tenant_id: str, template_id: str):
     supabase.table("form_templates").delete().eq("id", template_id).execute()
     return None
