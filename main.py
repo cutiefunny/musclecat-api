@@ -1,7 +1,7 @@
 import asyncio
 import os
-import json  # JSON 변환을 위해 추가
-from fastapi import FastAPI, BackgroundTasks, HTTPException, status, Query, Path, Body, APIRouter, Request # Request 추가
+import json
+from fastapi import FastAPI, BackgroundTasks, HTTPException, status, Query, Path, Body, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any, Union
@@ -9,7 +9,7 @@ from uuid import uuid4
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from sse_starlette.sse import EventSourceResponse # [설치 필요] pip install sse-starlette
+from sse_starlette.sse import EventSourceResponse
 
 # 환경 변수 로드
 load_dotenv()
@@ -21,7 +21,6 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 if not SUPABASE_URL or not SUPABASE_KEY:
     print("Warning: SUPABASE_URL or SUPABASE_KEY is missing in .env file.")
 
-# Client 생성 (전역)
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 except Exception as e:
@@ -31,7 +30,7 @@ except Exception as e:
 app = FastAPI(
     title="CLT Chatbot API (Supabase Integration)",
     description="API connected to Supabase for CLT Chatbot",
-    version="1.2.0"
+    version="1.3.0"
 )
 
 # --- CORS 설정 ---
@@ -62,18 +61,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==========================================
-# [전역 변수: 이벤트 큐]
-# ==========================================
-# 백그라운드 태스크와 SSE 엔드포인트 간의 통신을 위한 메모리 큐입니다.
-# 실제 상용 서비스(다중 서버)에서는 Redis Pub/Sub 등을 사용하는 것이 좋습니다.
 event_queue = asyncio.Queue()
-
 
 # ==========================================
 # [Models]
 # ==========================================
-# (이전과 동일한 모델 정의)
 
 # 1. Chat Models
 class ChatRequest(BaseModel):
@@ -113,17 +105,27 @@ class ConversationDetail(BaseModel):
     id: str
     messages: List[Message]
 
-# 3. Client Scenarios
-class ScenarioItem(BaseModel):
-    id: str
+# 3. Client Scenarios (Shortcuts) Models
+class Action(BaseModel):
+    type: str
+    value: Optional[str] = ""
+
+class ShortcutItem(BaseModel):
     title: str
-    description: str
+    description: Optional[str] = None
+    action: Optional[Action] = None
+    id: Optional[str] = None 
 
-class ScenarioCategory(BaseModel):
-    category: str
-    items: List[ScenarioItem]
+class ShortcutSubCategory(BaseModel):
+    title: str
+    items: List[ShortcutItem] = []
 
-# 4. Admin Models
+class ShortcutCategory(BaseModel):
+    name: str 
+    subCategories: List[ShortcutSubCategory] = []
+    items: List[ShortcutItem] = []
+
+# 4. Admin & Scenario Editor Models
 class NodePosition(BaseModel):
     x: float
     y: float
@@ -205,26 +207,10 @@ class FormTemplateCreate(BaseModel):
 class NodeVisibilitySettings(BaseModel):
     visibleNodeTypes: List[str]
 
-# 3. Client Scenarios (Shortcut) Models [수정됨]
-class Action(BaseModel):
-    type: str
-    value: Optional[str] = ""
-
-class ShortcutItem(BaseModel):
-    title: str
-    description: Optional[str] = None
-    action: Optional[Action] = None
-    # id 필드는 하위 호환성을 위해 남겨두거나 선택적으로 사용
-    id: Optional[str] = None 
-
-class ShortcutSubCategory(BaseModel):
-    title: str
-    items: List[ShortcutItem] = []
-
-class ShortcutCategory(BaseModel):
-    name: str # 프론트엔드에서 'category' 대신 'name'을 사용하는 경우가 있어 호환성 주의 (ScenarioEditor는 name 사용)
-    subCategories: List[ShortcutSubCategory] = []
-    items: List[ShortcutItem] = [] # 카테고리 직속 아이템 지원
+# [추가됨] 시나리오 세션 생성 요청 바디
+class CreateSessionRequest(BaseModel):
+    scenarioId: str
+    slots: Optional[Dict[str, Any]] = None
 
 
 # ==========================================
@@ -237,13 +223,11 @@ def get_utc_now():
 # [Background Tasks]
 # ==========================================
 async def perform_background_task(conversation_id: str):
-    # 1. 무거운 작업을 시뮬레이션 (5초 대기)
     print(f"⏳ [Task] 비동기 작업 시작 (ID: {conversation_id})")
     await asyncio.sleep(5) 
     
     success_msg = "✅ 처리 완료 (5초 후 생성됨)"
     
-    # 2. 작업 완료 후 DB에 결과 저장
     try:
         supabase.table("messages").insert({
             "conversation_id": conversation_id,
@@ -252,22 +236,18 @@ async def perform_background_task(conversation_id: str):
             "created_at": get_utc_now()
         }).execute()
         
-        # (선택) 대화방 updated_at 갱신
         supabase.table("conversations").update({
             "updated_at": get_utc_now()
         }).eq("id", conversation_id).execute()
         
         print(f"✅ [Task] 비동기 작업 완료 및 DB 저장 (ID: {conversation_id})")
         
-        # 3. [추가됨] SSE 큐에 완료 이벤트 전송
-        # 프론트엔드가 /events에 연결되어 있다면 이 메시지를 받게 됩니다.
         await event_queue.put({
             "conversation_id": conversation_id,
             "status": "done",
             "message": success_msg,
             "timestamp": get_utc_now()
         })
-        print(f"📡 [Task] SSE 알림 큐 전송 완료")
         
     except Exception as e:
         print(f"❌ [Task] Error in background task: {e}")
@@ -279,29 +259,16 @@ async def perform_background_task(conversation_id: str):
 # 1. SSE Endpoint
 @app.get("/events")
 async def sse_endpoint(request: Request):
-    """
-    Server-Sent Events 엔드포인트
-    클라이언트는 이 주소에 연결하여 백그라운드 작업 완료 알림을 실시간으로 수신합니다.
-    """
     async def event_generator():
         while True:
-            # 클라이언트 연결 끊김 확인
             if await request.is_disconnected():
                 break
-
-            # 큐에서 메시지가 올 때까지 대기 (비동기)
             try:
-                # 큐에서 데이터를 가져옴
                 data = await event_queue.get()
-                
-                # SSE 포맷으로 데이터 전송
-                # 한글 깨짐 방지를 위해 ensure_ascii=False 사용
                 yield {
                     "event": "message",
                     "data": json.dumps(data, ensure_ascii=False)
                 }
-                
-                # 큐 작업 완료 처리
                 event_queue.task_done()
             except asyncio.CancelledError:
                 break
@@ -314,25 +281,16 @@ async def sse_endpoint(request: Request):
 # 2. Existing Chat Endpoints
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
-    """
-    사용자 메시지를 저장하고 응답을 반환합니다.
-    '딜레이'가 포함되면 즉시 응답 후 백그라운드 작업을 실행합니다.
-    """
-    
-    # 1. 응답 메시지 결정 & 백그라운드 태스크 등록
+    # 간이 챗봇 로직 (테스트용)
     if "딜레이" in request.content:
-        response_msg = "⏳ 처리중입니다... (결과는 잠시 후 도착합니다)"
-        
-        # ✨ [핵심] 응답 리턴 후 실행할 작업을 큐에 등록
+        response_msg = "⏳ 처리중입니다..."
         if request.conversation_id:
             background_tasks.add_task(perform_background_task, request.conversation_id)
     else:
         response_msg = f"Echo: {request.content} (Supabase)"
 
-    # 2. DB 저장 로직 (사용자 메시지 + 1차 응답 메시지)
     if request.conversation_id:
         try:
-            # (1) 사용자 메시지 저장
             supabase.table("messages").insert({
                 "conversation_id": request.conversation_id,
                 "role": "user",
@@ -340,7 +298,6 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 "created_at": get_utc_now()
             }).execute()
 
-            # (2) 봇의 1차 응답(Echo 또는 처리중) 저장
             supabase.table("messages").insert({
                 "conversation_id": request.conversation_id,
                 "role": "assistant",
@@ -348,7 +305,6 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
                 "created_at": get_utc_now()
             }).execute()
             
-            # (3) 대화방 갱신
             supabase.table("conversations").update({
                 "updated_at": get_utc_now()
             }).eq("id", request.conversation_id).execute()
@@ -356,7 +312,6 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
         except Exception as e:
             print(f"Error saving chat: {e}")
 
-    # 3. 클라이언트에게는 즉시 응답 반환
     return {
         "type": "text",
         "message": response_msg,
@@ -364,28 +319,25 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
         "next_node": None
     }
 
+# --- Conversations ---
+
 @app.get("/conversations", response_model=List[ConversationSummary])
 async def get_conversations():
-    """모든 대화방 목록 조회 (최신순)"""
     res = supabase.table("conversations").select("*").order("updated_at", desc=True).execute()
     return res.data
 
 @app.post("/conversations", status_code=status.HTTP_201_CREATED, response_model=ConversationSummary)
 async def create_conversation(request: CreateConversationRequest):
-    """새 대화방 생성"""
     new_title = request.title if request.title else "New Chat"
-    
     data = {
         "title": new_title,
         "is_pinned": False,
         "created_at": get_utc_now(),
         "updated_at": get_utc_now()
     }
-    
     res = supabase.table("conversations").insert(data).execute()
     if not res.data:
         raise HTTPException(status_code=500, detail="Failed to create conversation")
-    
     return res.data[0]
 
 @app.get("/conversations/{conversation_id}", response_model=ConversationDetail)
@@ -394,7 +346,6 @@ async def get_conversation_detail(
     limit: int = Query(50),
     offset: int = Query(0)
 ):
-    """대화방 상세 및 메시지 페이징"""
     conv_res = supabase.table("conversations").select("id").eq("id", conversation_id).execute()
     if not conv_res.data:
         raise HTTPException(status_code=404, detail="Conversation not found")
@@ -420,13 +371,10 @@ async def update_conversation(conversation_id: str, request: UpdateConversationR
         update_data["is_pinned"] = request.is_pinned
         
     res = supabase.table("conversations").update(update_data).eq("id", conversation_id).execute()
-    
     if not res.data:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    
     return res.data[0]
 
-# [변경됨] DELETE -> POST + URL 뒤에 /delete 추가
 @app.post("/conversations/{conversation_id}/delete", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_conversation(conversation_id: str):
     res = supabase.table("conversations").delete().eq("id", conversation_id).execute()
@@ -434,46 +382,65 @@ async def delete_conversation(conversation_id: str):
          raise HTTPException(status_code=404, detail="Conversation not found")
     return None
 
-# Client Side Static Data -> Dynamic Data [수정됨]
+# --- [추가됨] Scenario Sessions ---
+
+@app.post("/conversations/{conversation_id}/sessions", status_code=status.HTTP_201_CREATED)
+async def create_scenario_session(conversation_id: str, request: CreateSessionRequest):
+    """
+    시나리오 세션을 생성합니다. (404 오류 해결용)
+    """
+    # 실제로는 'scenario_sessions' 테이블에 저장해야 하지만, 
+    # 현재 단계에서는 세션 ID만 발급하여 프론트엔드 흐름을 유지합니다.
+    session_id = str(uuid4())
+    
+    # (선택) 여기에 세션 생성 DB 로직 추가 가능
+    
+    return {
+        "sessionId": session_id,
+        "conversationId": conversation_id,
+        "scenarioId": request.scenarioId,
+        "status": "active"
+    }
+
+# 2. Scenarios / Shortcuts
+
 @app.get("/scenarios", response_model=List[ShortcutCategory])
 async def get_client_scenarios():
-    """
-    클라이언트용 숏컷(시나리오 카테고리) 목록 조회
-    Supabase 'shortcuts' 테이블에서 데이터를 가져옵니다.
-    """
+    """클라이언트용 숏컷(시나리오 카테고리) 목록 조회"""
     try:
-        # id가 1인 row를 전역 설정으로 간주하고 조회
         res = supabase.table("shortcuts").select("content").eq("id", 1).execute()
         if res.data and len(res.data) > 0:
             return res.data[0]["content"]
     except Exception as e:
         print(f"Error fetching shortcuts from DB: {e}")
-    
-    # DB에 데이터가 없거나 에러 발생 시 빈 리스트(또는 기본값) 반환
     return []
 
 @app.post("/scenarios", status_code=status.HTTP_201_CREATED)
 async def save_client_scenarios(scenarios: List[ShortcutCategory]):
-    """
-    클라이언트용 숏컷(시나리오 카테고리) 목록 저장
-    Supabase 'shortcuts' 테이블에 JSON 형태로 저장합니다.
-    """
+    """클라이언트용 숏컷 저장"""
     data = {
-        "id": 1, # 전역 설정을 위해 고정 ID 1 사용
+        "id": 1,
         "content": [s.model_dump() for s in scenarios],
         "updated_at": get_utc_now()
     }
-    
-    # upsert를 사용하여 기존 데이터가 있으면 업데이트, 없으면 생성
     res = supabase.table("shortcuts").upsert(data).execute()
-    
     if not res.data:
         raise HTTPException(status_code=500, detail="Failed to save scenarios")
-        
     return {"status": "success", "data": res.data}
 
+@app.get("/scenarios/list")
+async def get_real_scenario_list():
+    """숏컷 에디터용: 실제 DB에 존재하는 시나리오 ID와 이름 목록 반환"""
+    try:
+        # admin_scenarios 테이블에서 id, name 조회
+        res = supabase.table("admin_scenarios").select("id, name").execute()
+        return res.data 
+    except Exception as e:
+        print(f"Error fetching scenario list: {e}")
+        return []
 
-# 2. Admin/Management Endpoints
+# --- Admin/Management Endpoints ---
+
 admin_router = APIRouter(prefix="/api/v1/chat")
 
 @admin_router.get("/scenarios/{tenant_id}/{stage_id}", response_model=ScenarioListResponse)
@@ -510,7 +477,6 @@ async def create_admin_scenario(tenant_id: str, stage_id: str, request: CreateSc
         "last_used_at": get_utc_now()
     }
     
-    # 복제 로직
     if request.clone_from_id:
         original = supabase.table("admin_scenarios").select("*").eq("id", request.clone_from_id).execute()
         if original.data:
@@ -535,7 +501,6 @@ async def update_admin_scenario(tenant_id: str, stage_id: str, scenario_id: str,
         "start_node_id": request.start_node_id,
         "updated_at": get_utc_now()
     }
-    
     res = supabase.table("admin_scenarios").update(update_data).eq("id", scenario_id).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Scenario not found")
@@ -554,7 +519,6 @@ async def patch_admin_scenario(tenant_id: str, stage_id: str, scenario_id: str, 
         raise HTTPException(status_code=404, detail="Scenario not found")
     return res.data[0]
 
-# [변경됨] DELETE -> POST + URL 뒤에 /delete 추가
 @admin_router.post("/scenarios/{tenant_id}/{stage_id}/{scenario_id}/delete", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_admin_scenario(tenant_id: str, stage_id: str, scenario_id: str):
     res = supabase.table("admin_scenarios").delete().eq("id", scenario_id).execute()
@@ -563,6 +527,7 @@ async def delete_admin_scenario(tenant_id: str, stage_id: str, scenario_id: str)
     return None
 
 # --- Templates ---
+
 @admin_router.get("/templates/api/{tenant_id}", response_model=List[Dict])
 async def list_api_templates(tenant_id: str):
     res = supabase.table("api_templates").select("*").eq("tenant_id", tenant_id).execute()
@@ -575,7 +540,6 @@ async def create_api_template(tenant_id: str, request: ApiTemplateCreate):
     res = supabase.table("api_templates").insert(data).execute()
     return res.data[0]
 
-# [변경됨] DELETE -> POST + URL 뒤에 /delete 추가
 @admin_router.post("/templates/api/{tenant_id}/{template_id}/delete", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_api_template(tenant_id: str, template_id: str):
     supabase.table("api_templates").delete().eq("id", template_id).execute()
@@ -593,7 +557,6 @@ async def create_form_template(tenant_id: str, request: FormTemplateCreate):
     res = supabase.table("form_templates").insert(data).execute()
     return res.data[0]
 
-# [변경됨] DELETE -> POST + URL 뒤에 /delete 추가
 @admin_router.post("/templates/form/{tenant_id}/{template_id}/delete", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_form_template(tenant_id: str, template_id: str):
     supabase.table("form_templates").delete().eq("id", template_id).execute()
