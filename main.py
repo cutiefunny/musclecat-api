@@ -205,6 +205,27 @@ class FormTemplateCreate(BaseModel):
 class NodeVisibilitySettings(BaseModel):
     visibleNodeTypes: List[str]
 
+# 3. Client Scenarios (Shortcut) Models [수정됨]
+class Action(BaseModel):
+    type: str
+    value: Optional[str] = ""
+
+class ShortcutItem(BaseModel):
+    title: str
+    description: Optional[str] = None
+    action: Optional[Action] = None
+    # id 필드는 하위 호환성을 위해 남겨두거나 선택적으로 사용
+    id: Optional[str] = None 
+
+class ShortcutSubCategory(BaseModel):
+    title: str
+    items: List[ShortcutItem] = []
+
+class ShortcutCategory(BaseModel):
+    name: str # 프론트엔드에서 'category' 대신 'name'을 사용하는 경우가 있어 호환성 주의 (ScenarioEditor는 name 사용)
+    subCategories: List[ShortcutSubCategory] = []
+    items: List[ShortcutItem] = [] # 카테고리 직속 아이템 지원
+
 
 # ==========================================
 # [Helpers]
@@ -413,25 +434,43 @@ async def delete_conversation(conversation_id: str):
          raise HTTPException(status_code=404, detail="Conversation not found")
     return None
 
-# Client Side Static Data
-@app.get("/scenarios", response_model=List[ScenarioCategory])
+# Client Side Static Data -> Dynamic Data [수정됨]
+@app.get("/scenarios", response_model=List[ShortcutCategory])
 async def get_client_scenarios():
-    return [
-        {
-            "category": "인사",
-            "items": [
-                {"id": "greeting", "title": "기본 인사", "description": "봇과 가볍게 인사를 나눕니다."},
-                {"id": "intro", "title": "봇 소개", "description": "이 봇의 기능을 설명합니다."}
-            ]
-        },
-        {
-            "category": "민원",
-            "items": [
-                {"id": "visa", "title": "비자 문의", "description": "비자 발급 절차를 안내합니다."},
-                {"id": "tax", "title": "세금 납부", "description": "지방세 납부 방법을 안내합니다."}
-            ]
-        }
-    ]
+    """
+    클라이언트용 숏컷(시나리오 카테고리) 목록 조회
+    Supabase 'shortcuts' 테이블에서 데이터를 가져옵니다.
+    """
+    try:
+        # id가 1인 row를 전역 설정으로 간주하고 조회
+        res = supabase.table("shortcuts").select("content").eq("id", 1).execute()
+        if res.data and len(res.data) > 0:
+            return res.data[0]["content"]
+    except Exception as e:
+        print(f"Error fetching shortcuts from DB: {e}")
+    
+    # DB에 데이터가 없거나 에러 발생 시 빈 리스트(또는 기본값) 반환
+    return []
+
+@app.post("/scenarios", status_code=status.HTTP_201_CREATED)
+async def save_client_scenarios(scenarios: List[ShortcutCategory]):
+    """
+    클라이언트용 숏컷(시나리오 카테고리) 목록 저장
+    Supabase 'shortcuts' 테이블에 JSON 형태로 저장합니다.
+    """
+    data = {
+        "id": 1, # 전역 설정을 위해 고정 ID 1 사용
+        "content": [s.model_dump() for s in scenarios],
+        "updated_at": get_utc_now()
+    }
+    
+    # upsert를 사용하여 기존 데이터가 있으면 업데이트, 없으면 생성
+    res = supabase.table("shortcuts").upsert(data).execute()
+    
+    if not res.data:
+        raise HTTPException(status_code=500, detail="Failed to save scenarios")
+        
+    return {"status": "success", "data": res.data}
 
 
 # 2. Admin/Management Endpoints
